@@ -11,7 +11,7 @@ Genomic coordinates use **GRCh38/hg38**. LD matrices are computed using **magenp
 
 - **Docker Desktop** — must be installed and running. PLINK 1.9 runs inside a Docker container, so no local PLINK installation is necessary.
 - **uv** — Python environment and dependency management.
-- **Python 3.10+** — managed through `uv`.
+- **Python 3.11–3.13** — managed through `uv`.
 - **aria2 (optional)** — enables a parallel, resumable dbSNP download and is
   automatically preferred over `curl` when installed.
 - **Disk space** — sufficient for the genotype archive, dbSNP VCF, GRCh38
@@ -80,7 +80,7 @@ From the project root:
 
 ```bash
 uv venv
-uv pip install magenpy 'zarr<3' numpy pandas
+uv pip install 'magenpy==0.2.5' 'zarr<3' numpy pandas
 ```
 
 Zarr v2 is required for metadata consolidation and ZIP packaging.
@@ -186,7 +186,10 @@ Not all ancestry-specific block files may be available. Missing populations are 
 
 ## 6. Compute LD matrices
 
-LD computation uses `mgp_compute_ld` from magenpy.
+LD computation uses `mgp_compute_ld` from magenpy **v0.2.5**, including its
+`--zip` flag to consolidate metadata and create the uncompressed ZIP archive
+automatically. This release includes the ancestry-frequency and BED block-offset
+fixes; no local magenpy patches are needed.
 
 PLINK 1.9 runs inside Docker to extract individual chromosomes from the genome-wide genotype dataset. Chromosome-specific PLINK files are cached and reused across ancestry groups.
 
@@ -284,14 +287,17 @@ Each ZIP archive contains a Zarr v2 LD matrix with:
 - Uncompressed ZIP members (`ZIP_STORED`).
 - Naturally sorted data chunks.
 - `.zmetadata` stored as the final ZIP member.
-- ZIP integrity verification before finalization.
+- ZIP integrity verification before recording pipeline completion.
 
 This layout is designed for efficient access through cloud object storage services supporting HTTP range requests.
 
 ## 8. Resume interrupted runs
 
 The pipeline automatically skips existing nonempty ZIP archives with a current
-annotation marker and reuses current chromosome-specific PLINK files.
+annotation marker identifying magenpy v0.2.5 and reuses current chromosome-specific
+PLINK files. Archives from earlier versions are rebuilt automatically, including
+all ancestries affected by the previous frequency and LD computation bugs.
+Changes to keep files, LD block files, or the compute script also trigger rebuilding.
 Regenerating either the rsID maps or genetic maps makes the corresponding
 cached files and archives stale, so they are rebuilt on the next run.
 Completion markers are kept under `data/.pipeline_state/ld/`, leaving the LD
@@ -311,7 +317,10 @@ CHROMS=22 POPULATIONS=EUR bash scripts/compute_ld.sh
 ```
 
 Current ZIP archives are assumed valid when skipped; they are not revalidated
-on every run.
+on every run. Unpackaged or incomplete directory stores are recomputed using
+`mgp_compute_ld --zip`. Directory stores are deleted after archive verification
+by default; set `DELETE_STORES=0` to retain them. Rebuild any existing
+`data/ld_zenodo/` packages from the corrected archives before distribution.
 
 ## 9. Project structure
 
@@ -358,7 +367,7 @@ project/
 ```bash
 # 1. Create Python environment
 uv venv
-uv pip install magenpy 'zarr<3' numpy pandas
+uv pip install 'magenpy==0.2.5' 'zarr<3' numpy pandas
 
 # 2. Verify Docker is running
 docker info

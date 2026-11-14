@@ -85,8 +85,7 @@ mkdir -p \
     "$CHR_DIR" \
     "$OUTPUT_DIR" \
     "$CHROMOSOME_STATE_DIR" \
-    "$LD_RUN_STATE_DIR/archives" \
-    "$LD_RUN_STATE_DIR/stores"
+    "$LD_RUN_STATE_DIR/archives"
 
 # ------------------------------------------------------------
 # Dependencies
@@ -108,7 +107,10 @@ PYTHON=(uv run --no-project python)
 MAGENPY=(uv run --no-project mgp_compute_ld)
 
 "${PYTHON[@]}" -c '
+import magenpy
 import zarr
+if magenpy.__version__ != "0.2.5":
+    raise RuntimeError("Install magenpy==0.2.5 before computing LD")
 assert int(zarr.__version__.split(".")[0]) == 2, \
     "Zarr v2 is required"
 '
@@ -283,89 +285,27 @@ prepare_chromosome() {
 }
 
 # ------------------------------------------------------------
-# Consolidate and package Zarr
+# Verify archives produced by mgp_compute_ld --zip
 # ------------------------------------------------------------
 
-package_zarr() {
-    local store="$1"
-    local archive="$2"
-
-    "${PYTHON[@]}" - "$store" "$archive" <<'PY'
-import pathlib
-import re
+validate_archive() {
+    "${PYTHON[@]}" - "$1" <<'PYZIP'
 import sys
 import zipfile
 
-import zarr
-
-store = pathlib.Path(sys.argv[1]).resolve()
-target = pathlib.Path(sys.argv[2]).resolve()
-tmp = target.with_name(target.name + ".tmp")
-
-if not (store / ".zgroup").is_file():
-    raise RuntimeError(f"Not a Zarr v2 group: {store}")
-
-zarr.consolidate_metadata(str(store))
-
-metadata = store / ".zmetadata"
-if not metadata.is_file():
-    raise RuntimeError("Missing .zmetadata")
-
-def natural_key(path):
-    rel = path.relative_to(store).as_posix()
-    return [
-        (0, int(s)) if s.isdigit() else (1, s)
-        for s in re.split(r"(\d+)", rel)
-    ]
-
-files = sorted(
-    (
-        p for p in store.rglob("*")
-        if p.is_file() and p != metadata
-    ),
-    key=natural_key,
-)
-files.append(metadata)
-
-try:
-    with zipfile.ZipFile(
-        tmp,
-        "w",
-        compression=zipfile.ZIP_STORED,
-        allowZip64=True,
-    ) as z:
-        for path in files:
-            z.write(
-                path,
-                path.relative_to(store).as_posix(),
-                compress_type=zipfile.ZIP_STORED,
-            )
-
-    with zipfile.ZipFile(tmp) as z:
-        members = [
-            i for i in z.infolist()
-            if not i.is_dir()
-        ]
-
-        assert members, "Empty ZIP"
-        assert z.testzip() is None, "ZIP integrity failure"
-        assert members[-1].filename == ".zmetadata"
-        assert all(
-            i.compress_type == zipfile.ZIP_STORED
-            for i in members
-        )
-
-    tmp.replace(target)
-
-except Exception:
-    tmp.unlink(missing_ok=True)
-    raise
-
-print(
-    f"Validated {target}: "
-    f"{target.stat().st_size / 1e9:.2f} GB"
-)
-PY
+with zipfile.ZipFile(sys.argv[1]) as archive:
+    members = archive.infolist()
+    names = {member.filename for member in members}
+    if not {".zgroup", ".zmetadata"}.issubset(names):
+        raise RuntimeError("Expected a root-level consolidated Zarr ZIP store")
+    if members[-1].filename != ".zmetadata":
+        raise RuntimeError("Consolidated metadata must be the final ZIP member")
+    if any(member.compress_type != zipfile.ZIP_STORED for member in members):
+        raise RuntimeError("Expected uncompressed ZIP members")
+    if archive.testzip() is not None:
+        raise RuntimeError("ZIP integrity verification failed")
+print(f"Validated {sys.argv[1]}")
+PYZIP
 }
 
 # ------------------------------------------------------------
@@ -385,90 +325,53 @@ run_ld_job() {
     local out="$OUTPUT_DIR/$pop"
     local store="$out/chr_${chr}"
     local archive="$out/chr_${chr}.zip"
-    local store_marker="$LD_RUN_STATE_DIR/stores/$pop/chr_${chr}.complete"
     local archive_marker="$LD_RUN_STATE_DIR/archives/$pop/chr_${chr}.complete"
-    local legacy_store_marker="${store}.annotations"
-    local legacy_archive_marker="${archive}.annotations"
-    local rsid_map="$RSID_DIR/chr_${chr}.tsv"
-    local genetic_map="$GENETIC_MAP_DIR/chr_${chr}.tsv"
     local metadata
     local -a estimator_args
     local tag="[$pop chr$chr]"
 
-    mkdir -p \
-        "$out" \
-        "$(dirname "$store_marker")" \
-        "$(dirname "$archive_marker")"
-    migrate_marker "$legacy_store_marker" "$store_marker"
-    migrate_marker "$legacy_archive_marker" "$archive_marker"
+    mkdir -p "$out" "$(dirname "$archive_marker")"
+    # A failed recomputation must not leave a previous completion marker valid.
+    rm -f -- "$archive_marker"
 
-    if [[ -s "$archive" ]]; then
-        echo "$tag Rebuilding stale pre-annotation archive"
-    fi
-
-    if [[ -d "$store" ]] &&
-       ! artifact_is_current \
-           "$store/.zgroup" "$store_marker" \
-           "$rsid_map" "$genetic_map"; then
-        echo "$tag Removing stale pre-annotation store"
-        rm -rf -- "$store"
-        rm -f -- "$store_marker"
-    fi
-
-    if [[ ! -d "$store" ]]; then
-        echo "$tag Computing LD..."
-
-        estimator_args=(--estimator "$LD_ESTIMATOR")
-        if [[ "$LD_ESTIMATOR" == block ]]; then
-            estimator_args+=(--ld-blocks "$block")
-            metadata="Biobank=1KG+HGDP,Ancestry=${pop},Estimator=block"
-        else
-            estimator_args+=(--ld-window-cm "$LD_WINDOW_CM")
-            metadata="Biobank=1KG+HGDP,Ancestry=${pop},Estimator=windowed"
-            metadata+=",WindowCM=${LD_WINDOW_CM}"
-        fi
-
-        if ! "${MAGENPY[@]}" \
-            --bfile "$chr_prefix" \
-            --keep "$keep" \
-            --backend magenpy \
-            "${estimator_args[@]}" \
-            --min-mac 10 \
-            --min-maf "$MIN_MAF" \
-            --storage-dtype "$STORAGE_DTYPE" \
-            --compressor "$COMPRESSOR" \
-            --genome-build "GRCh38" \
-            --metadata "$metadata" \
-            --compression-level "$COMPRESSION_LEVEL" \
-            --output-dir "$out"; then
-
-            echo "$tag ERROR: LD computation failed" >&2
-            return 1
-        fi
-
-        touch "$store_marker"
+    echo "$tag Computing LD and creating consolidated ZIP archive..."
+    estimator_args=(--estimator "$LD_ESTIMATOR")
+    if [[ "$LD_ESTIMATOR" == block ]]; then
+        estimator_args+=(--ld-blocks "$block")
+        metadata="Biobank=1KG+HGDP,Ancestry=${pop},Estimator=block"
     else
-        echo "$tag Reusing completed Zarr store"
+        estimator_args+=(--ld-window-cm "$LD_WINDOW_CM")
+        metadata="Biobank=1KG+HGDP,Ancestry=${pop},Estimator=windowed"
+        metadata+=",WindowCM=${LD_WINDOW_CM}"
     fi
 
-    if [[ ! -f "$store/.zgroup" ]]; then
-        echo "$tag ERROR: Missing Zarr store: $store" >&2
+    if ! "${MAGENPY[@]}" \
+        --bfile "$chr_prefix" \
+        --keep "$keep" \
+        --backend magenpy \
+        "${estimator_args[@]}" \
+        --min-mac 10 \
+        --min-maf "$MIN_MAF" \
+        --storage-dtype "$STORAGE_DTYPE" \
+        --compressor "$COMPRESSOR" \
+        --genome-build "GRCh38" \
+        --metadata "$metadata" \
+        --compression-level "$COMPRESSION_LEVEL" \
+        --zip \
+        --output-dir "$out"; then
+        echo "$tag ERROR: LD computation or ZIP creation failed" >&2
         return 1
     fi
 
-    echo "$tag Packaging..."
-    if ! package_zarr "$store" "$archive"; then
-        echo "$tag ERROR: Packaging failed" >&2
+    if ! validate_archive "$archive"; then
+        echo "$tag ERROR: Archive verification failed" >&2
         return 1
     fi
-
-    touch "$archive_marker"
+    printf '%s\n' 'magenpy=0.2.5' > "$archive_marker"
 
     if [[ "$DELETE_STORES" == 1 ]]; then
         rm -rf -- "$store"
-        rm -f -- "$store_marker"
     fi
-
     echo "$tag DONE"
 }
 
@@ -573,9 +476,14 @@ for chr in $CHROMS; do
             continue
         fi
 
-        if artifact_is_current \
-            "$archive" "$archive_marker" \
-            "$rsid_map" "$genetic_map"; then
+        archive_dependencies=("$rsid_map" "$genetic_map" "$keep" "$SCRIPT_DIR/compute_ld.sh")
+        if [[ "$LD_ESTIMATOR" == block ]]; then
+            archive_dependencies+=("$block")
+        fi
+        if [[ -f "$archive_marker" &&
+              "$(sed -n '1p' "$archive_marker")" == 'magenpy=0.2.5' ]] &&
+           artifact_is_current \
+               "$archive" "$archive_marker" "${archive_dependencies[@]}"; then
             echo "Already packaged: $archive"
             ((skipped+=1))
             continue
